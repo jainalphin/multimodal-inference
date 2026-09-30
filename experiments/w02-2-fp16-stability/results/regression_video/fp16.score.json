@@ -1,0 +1,23 @@
+{
+  "set": "regression_video",
+  "n": 36,
+  "predictions": "/teamspace/studios/this_studio/runs/w2-2/regression_video/fp16.jsonl",
+  "baseline": "/teamspace/studios/this_studio/runs/w2-2/regression_video/fp32.jsonl",
+  "accuracy": [
+    0.6111111111111112,
+    0.4444444444444444,
+    0.7777777777777778
+  ],
+  "baseline_accuracy": 0.6111111111111112,
+  "diff_vs_baseline": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "agreement": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "changed_ids": []
+}

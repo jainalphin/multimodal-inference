@@ -1,0 +1,26 @@
+{
+  "set": "regression_image",
+  "n": 200,
+  "predictions": "/teamspace/studios/this_studio/runs/w2-2/regression_image/fp16.jsonl",
+  "baseline": "/teamspace/studios/this_studio/runs/w2-2/regression_image/fp32.jsonl",
+  "ANLS": [
+    0.9376114145001341,
+    0.9038002631387921,
+    0.966229319105691
+  ],
+  "baseline_ANLS": 0.9476114145001341,
+  "diff_vs_baseline": [
+    -0.01,
+    -0.025,
+    0.0
+  ],
+  "agreement": [
+    0.99,
+    0.975,
+    1.0
+  ],
+  "changed_ids": [
+    "docvqa_46238",
+    "docvqa_50818"
+  ]
+}

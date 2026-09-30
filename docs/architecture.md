@@ -1,40 +1,66 @@
-Qwen 2.5 VL 3B
+# Qwen2.5-VL video path
 
-Checkpoint revision: `66285546d2b821cf421d4f5eb2576359d3770cd3`.
-The reported W4 rerun ran on an NVIDIA L4 in Lightning AI Compute.
+Supporting detail for the finding in the [main README](../README.md).
 
-> W4 rerun (`1024×1024` generated image): `pixel_values` is `(5476, 1176)`, `image_grid_thw` is `(1, 74, 74)`, and `input_ids` is `(1, 1394)`. The 2×2 merger maps 5,476 vision patches to 1,369 visual-token positions, leaving 25 non-image text positions (`1394 − 1369`).
+```text
+video frames
+  → sample and resize
+  → 3D patch embedding
+  → vision encoder (32 blocks)
+  → 2×2 visual-token merger
+  → scatter visual tokens into the text sequence
+  → language-model prefill and decode
+```
 
-> “Your shape” contains only tensors printed by the W4 hook trace. “Not captured” means the row describes an interface or operation but the script did not record that tensor; it is not presented as a measurement.
+## Measured shapes
 
-For latency, memory, and end-to-end performance results, see the [W1 overall findings](findings/w1-vlm-overall-summary.md).
+`clip_08s.mp4` at 2 FPS, bf16 on L4, forward hooks.
+`video_grid_thw = [[8, 26, 46]]` — 8 frame groups of 26×46 patches.
 
-## Vision side
+| Stage | Shape | Where the numbers come from |
+|---|---|---|
+| Processor output | `(9568, 1176)` | 9568 = 8 × 26 × 46 patch rows; 1176 = 3 ch × 2 temporal × 14 × 14 |
+| Patch embedding | `(9568, 1280)` | 1280 = vision width |
+| Each of 32 vision blocks | `(9568, 1280)` | shape-preserving; full attention at 7, 15, 23, 31 |
+| 2×2 merger | `(2392, 2048)` | 2392 = 9568 / 2²; merger input 5120 = 1280 × 2²; 2048 = LLM width |
+| LLM embedding / block 0 | `(1, 2420, 2048)` | 2420 = 2392 visual + 28 text |
+| LM head | `(1, 2420, 151936)` | 151936 = vocab size |
 
-| # | Component | Likely module/class name | What it does | Predicted shape | Your shape |
-|---|---|---|---|---|---|
-| 1 | Raw image input | — (before processor) | original pixel data | (H, W, 3) | (1024, 1024, 3) |
-| 2 | Preprocessing / resize | `Qwen2_5_VLImageProcessor` | resizes and normalizes; each flattened vision input row contains two RGB 14×14 patches | `pixel_values`: (patches, 1176); `image_grid_thw`: (T, H, W) | `pixel_values`: (5476, 1176); `image_grid_thw`: (1, 74, 74) |
-| 3 | Patch embedding | `Qwen2_5_VisionPatchEmbed` | maps each packed pair of temporal 14×14 RGB patches (1,176 values) to one 1,280-dim vision vector | (5476, 1280) | (5476, 1280) |
-| 4 | Rotary position calc | often a function, not a hookable module (e.g. `rot_pos_emb`) | computes vision positional rotations | n/a (not captured by this hook set) | not captured |
-| 5a | ViT block — windowed (pick one, e.g. block 0) | `model.visual.blocks[0]` | norm → windowed self-attn → residual → norm → SwiGLU MLP → residual | in/out: (5476, 1280) |(5476, 1280) |
-| 5b | ViT block — full attention (pick block 7) | `model.visual.blocks[7]` | same structure, but full self-attn over all patches | in/out: (5476, 1280) |(5476, 1280) |
-| 6 | Merger / projector | `model.visual.merger` (a `Qwen2_5_VLPatchMerger`-type class) | groups 2×2 patches, concatenates, 2-layer MLP projects to LLM width | (5476, 1280) → (1369, hidden_size) | (1369,2048) |
+2,392 video tokens + 28 text = 2,420. Merger rows equal the video-token count,
+and 8 groups × 299 = 2,392. Peak 8.8 GiB including weights.
 
-## Bridge (vision → language)
+**`llm_embed` fires before `patch_embed`.** Not a bug: the LLM embeds the whole
+`input_ids` sequence, placeholders included, before the vision tower runs; the
+merger output is then scattered into those positions. So the visual and text
+paths are not a simple sequential pipeline.
 
-| # | Component | Likely module | What it does | Predicted shape | Your shape |
-|---|---|---|---|---|---|
-| 7 | Initial LLM embedding lookup | `model.model.language_model.embed_tokens` | embeds all 1,394 input IDs, including 1,369 image-placeholder IDs | (batch, sequence, hidden_size) | (1, 1394, 2048) |
-| 8 | Visual embedding scatter | inside the top-level `forward()` | replaces the 1,369 image-placeholder embeddings with merger output at the same sequence positions | (1, 1394, 2048) | shape-preserving; not separately hooked |
-| 9 | MRoPE position ids | a function like `get_rope_index` | computes the (t, h, w) position IDs for every token, text and visual | n/a — log the position_ids tensor shape, e.g. (3, sequence) | not captured |
+## Token count vs resolution
 
-## Language side
+Visual tokens are `(H/14 × W/14) / 2²` = `(H × W) / 784` — **quadratic in side
+length**. Doubling resolution quadruples visual tokens, and prefill grows
+faster still since attention is quadratic in sequence length.
 
-| # | Component | Likely module | What it does | Predicted shape | Your shape |
-|---|---|---|---|---|---|
-| 10 | First LLM decoder layer | `model.model.language_model.layers[0]` | norm → GQA self-attn (causal) → residual → norm → SwiGLU MLP → residual | (batch, sequence, hidden_size) | (1, 1394, 2048) |
-| 11 | Final norm | `model.model.language_model.norm` | last RMSNorm before the output head | (batch, sequence, hidden_size) | not captured |
-| 12 | LM head | `model.lm_head` | projects to vocabulary logits | (batch, sequence, vocab) | (1, 1394, 151936) |
+| Input | Patch grid | ViT patches | Visual tokens |
+|---|---|---:|---:|
+| 448×448 | 32×32 | 1,024 | 256 |
+| 1036×1036 | 74×74 | 5,476 | 1,369 |
+| 2044×2044 | 146×146 | 21,316 | 5,329 |
 
-The W4 rerun confirms 32 vision blocks, numbered 0–31. Its checkpoint configuration reports full-attention blocks `[7, 15, 23, 31]`; the other 28 are windowed. It also reports spatial merge size 2, vision MLP intermediate size 3,420, LLM hidden size 2,048, LLM MLP intermediate size 11,008, and vocabulary size 151,936.
+For video the unit is a **frame group of 2 fused frames**: at 364×644 that is a
+26×46 patch grid → 299 merged positions per group, i.e. 149.5 per actual frame.
+
+## Checkpoint
+
+- `Qwen/Qwen2.5-VL-3B-Instruct`, revision `66285546d2b821cf421d4f5eb2576359d3770cd3`
+- Vision: 32 blocks, width 1,280, full attention at 7/15/23/31, spatial merge 2×2
+- Language: width 2,048, MLP 11,008, vocab 151,936
+
+## Reproducing
+
+```bash
+python experiments/w01-4-architecture/qwen2.5vl-3b.py
+```
+
+Matches the W1-3 configuration and hooks every stage above. Writes
+`runs/<UTC time>_w4/run.json` with shapes, token accounting, and consistency
+checks. `runs/` is gitignored.
